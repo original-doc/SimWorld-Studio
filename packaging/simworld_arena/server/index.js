@@ -1,5 +1,52 @@
-"use strict";const{spawn}=require("child_process"),express=require("express"),cors=require("cors"),path=require("path"),fs=require("fs"),{SkillRegistry}=require("./skills"),{SceneManager}=require("./scenes"),{ArenaManager}=require("./arena"),{AgentManager}=require("./agents"),PORT=parseInt(process.env.PORT||"3002",10),CLAUDE_BIN=process.env.CLAUDE_BIN||"claude",MCP_CONFIG=path.resolve(__dirname,"../mcp.json"),ARENA_ROOT=path.resolve(__dirname,"../.."),SCREENSHOT_DIR=path.join(ARENA_ROOT,"tmp","screens"),LOG_DIR=path.join(ARENA_ROOT,"logs"),PIXEL_STREAMING_URL=process.env.PIXEL_STREAMING_URL||"http://127.0.0.1:8080",UNREAL_HOST=process.env.UNREAL_HOST||"127.0.0.1",UNREAL_PORT=process.env.UNREAL_PORT||"55559",skillRegistry=new SkillRegistry,sceneManager=new SceneManager,arenaManager=new ArenaManager,agentManager=new AgentManager,SCREENSHOT_SEARCH_DIRS=[SCREENSHOT_DIR];fs.mkdirSync(SCREENSHOT_DIR,{recursive:!0}),fs.mkdirSync(LOG_DIR,{recursive:!0});function getLogFilePath(){const e=new Date().toISOString().slice(0,10);return path.join(LOG_DIR,`chat_${e}.log`)}function logToFile(s,e){const n=`[${new Date().toISOString()}] [${s}] ${e}
-`;try{fs.appendFileSync(getLogFilePath(),n)}catch{}console.log(`[${s}] ${e}`)}const ARENA_SYSTEM_PROMPT=`You are the SimWorld Studio scene-generation agent.
+"use strict";
+
+const { spawn } = require("child_process");
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const fs = require("fs");
+const { SkillRegistry } = require("./skills");
+const { SceneManager } = require("./scenes");
+const { ArenaManager } = require("./arena");
+const { AgentManager } = require("./agents");
+
+const PORT = parseInt(process.env.PORT || "3002", 10);
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const MCP_CONFIG = path.resolve(__dirname, "../mcp.json");
+const ARENA_ROOT = path.resolve(__dirname, "../..");
+const SCREENSHOT_DIR = path.join(ARENA_ROOT, "tmp", "screens");
+const LOG_DIR = path.join(ARENA_ROOT, "logs");
+const PIXEL_STREAMING_URL = process.env.PIXEL_STREAMING_URL || "http://127.0.0.1:8080";
+const UNREAL_HOST = process.env.UNREAL_HOST || "127.0.0.1";
+const UNREAL_PORT = process.env.UNREAL_PORT || "55559";
+
+const skillRegistry = new SkillRegistry();
+const sceneManager = new SceneManager();
+const arenaManager = new ArenaManager();
+const agentManager = new AgentManager();
+
+const SCREENSHOT_SEARCH_DIRS = [SCREENSHOT_DIR];
+fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+fs.mkdirSync(LOG_DIR, { recursive: true });
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX 1: Session result cache — survives browser disconnect
+// ═══════════════════════════════════════════════════════════════════════
+let lastSessionResult = null;
+const activeSessions = new Map(); // sessionId -> { status, result, startedAt }
+
+function getLogFilePath() {
+  const d = new Date().toISOString().slice(0, 10);
+  return path.join(LOG_DIR, `chat_${d}.log`);
+}
+
+function logToFile(tag, msg) {
+  const line = `[${new Date().toISOString()}] [${tag}] ${msg}\n`;
+  try { fs.appendFileSync(getLogFilePath(), line); } catch {}
+  console.log(`[${tag}] ${msg}`);
+}
+
+const ARENA_SYSTEM_PROMPT = `You are the SimWorld Studio scene-generation agent.
 You build city scenes in Unreal Engine 5 using MCP tools. The user sees a live viewport on the right.
 
 ## CRITICAL: HOW TO SPAWN OBJECTS
@@ -18,7 +65,7 @@ IMPORTANT: ONLY use BP_Building_01 through BP_Building_06. Do NOT use any buildi
 - BP_Building_05: medium building
 - BP_Building_06: medium building
 
-Example \u2014 spawn a house:
+Example — spawn a house:
   spawn_blueprint_actor(actor_name="House_1", blueprint_id="BP_Building_05", location=[0, 0, 0])
 
 ### Trees (6 varieties)
@@ -33,7 +80,7 @@ Example \u2014 spawn a house:
 ### Vehicles
   BP_Scooter_01 through BP_Scooter_04, BP_Cart, BP_Cart2
 
-### Roads (static mesh \u2014 use spawn_actor)
+### Roads (static mesh — use spawn_actor)
   spawn_actor(name="Road_1", static_mesh="/Game/CityDatabase/meshes/SM_Road.SM_Road", location=[0,0,0], scale=[10,10,1])
 
 ## UNITS & SPACING
@@ -43,7 +90,7 @@ Example \u2014 spawn a house:
 - Trees: 1000-2000 units apart
 - A small residential block: roughly 15000x10000 units
 
-## WORKFLOW \u2014 FOLLOW THIS EXACTLY
+## WORKFLOW — FOLLOW THIS EXACTLY
 1. Call delete_all_spawned() FIRST to clear previous session objects
 2. Call setup_environment() to create sun, sky, fog, ground. Without it the scene is BLACK.
 3. Plan the layout: calculate positions for all objects before spawning
@@ -75,7 +122,18 @@ Example \u2014 spawn a house:
 - Use varied blueprint_ids (don't use the same building for everything)
 - After placing objects, ALWAYS take_screenshot so the user sees results
 - DO NOT set or move the camera. DO NOT use execute_python_script to change camera position/rotation. The camera is controlled by the user via the viewport. Just call take_screenshot directly.
-- Keep it simple: spawn objects, screenshot. Don't overthink it.`,app=express();app.use(cors()),app.use(express.json({limit:"10mb"})),app.use("/screenshots",express.static(SCREENSHOT_DIR)),app.use("/thumbnails",express.static(path.join(ARENA_ROOT,"tmp","thumbnails"))),app.get("/ue",(s,e)=>{e.setHeader("Content-Type","text/html"),e.send(`<!DOCTYPE html>
+- Keep it simple: spawn objects, screenshot. Don't overthink it.`;
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
+app.use("/screenshots", express.static(SCREENSHOT_DIR));
+app.use("/thumbnails", express.static(path.join(ARENA_ROOT, "tmp", "thumbnails")));
+
+// ── UE pixel streaming page ──
+app.get("/ue", (req, res) => {
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html>
 <html style="width:100%;height:100%;margin:0;background:#000">
 <head><meta charset="utf-8"><title>UE Pixel Stream</title>
 <style>body{margin:0;width:100vw;height:100vh;background:#000;overflow:hidden}</style>
@@ -85,34 +143,637 @@ if(!p.has('ss')){p.set('ss','ws://'+location.hostname+':8080');
 location.replace(location.pathname+'?'+p.toString());}})();
 </script>
 <script defer src="/ue-assets/player.js"></script>
-</head><body style="width:100vw;height:100vh"></body></html>`)}),app.get("/api/pixel-streaming-url",(s,e)=>{const t=s.headers.host?.split(":")[0]||"127.0.0.1";e.json({url:`http://${t}:8080`})}),app.get("/api/health",(s,e)=>{const t=require("net");let n=!1;const o=new t.Socket,i=setTimeout(()=>{o.destroy(),a()},2e3);o.connect(parseInt(UNREAL_PORT),UNREAL_HOST,()=>{n=!0,o.destroy(),clearTimeout(i),a()}),o.on("error",()=>{clearTimeout(i),a()});function a(){e.json({status:"ok",ueConnected:n,mcpConnected:n,pixelStreamingUrl:PIXEL_STREAMING_URL})}}),app.get("/api/screenshot/latest",(s,e)=>{let t=null;for(const n of SCREENSHOT_SEARCH_DIRS)if(fs.existsSync(n))try{const o=fs.readdirSync(n).filter(i=>i.endsWith(".png")).map(i=>({filepath:path.join(n,i),time:fs.statSync(path.join(n,i)).mtimeMs})).filter(({time:i})=>Date.now()-i<18e5);for(const i of o)(!t||i.time>t.time)&&(t=i)}catch{}if(!t)return e.status(404).json({error:"No screenshots found"});e.setHeader("Cache-Control","no-store"),e.sendFile(t.filepath)}),app.get("/api/screenshot/file",(s,e)=>{const t=s.query.path;if(!t||!fs.existsSync(t))return e.status(404).json({error:"Not found"});e.setHeader("Cache-Control","no-store"),e.sendFile(path.resolve(t))}),app.post("/api/camera",(s,e)=>{const{cmd:t,args:n=[]}=s.body;if(!["set_camera","get_camera"].includes(t))return e.status(400).json({error:"Unknown camera command"});const i=require("net"),a=new i.Socket,c=setTimeout(()=>{a.destroy(),e.status(504).json({error:"Timeout"})},1e4);let m={};if(t==="set_camera"&&n.length>=6)m={script:`
+</head><body style="width:100vw;height:100vh"></body></html>`);
+});
+
+app.get("/api/pixel-streaming-url", (req, res) => {
+  const host = req.headers.host?.split(":")[0] || "127.0.0.1";
+  res.json({ url: `http://${host}:8080` });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX 2: Session recovery endpoints
+// ═══════════════════════════════════════════════════════════════════════
+app.get("/api/session/latest", (req, res) => {
+  if (!lastSessionResult) return res.status(404).json({ error: "No session yet" });
+  res.json(lastSessionResult);
+});
+
+app.get("/api/session/active", (req, res) => {
+  const active = [];
+  for (const [id, info] of activeSessions) {
+    active.push({ sessionId: id, status: info.status, startedAt: info.startedAt });
+  }
+  res.json({ active, lastResult: lastSessionResult ? {
+    sessionId: lastSessionResult.sessionId,
+    timestamp: lastSessionResult.timestamp,
+    latestScreenshot: lastSessionResult.latestScreenshot
+  } : null });
+});
+
+// ── Health ──
+app.get("/api/health", (req, res) => {
+  const net = require("net");
+  let ueUp = false;
+  const sock = new net.Socket();
+  const timer = setTimeout(() => { sock.destroy(); done(); }, 2000);
+  sock.connect(parseInt(UNREAL_PORT), UNREAL_HOST, () => {
+    ueUp = true; sock.destroy(); clearTimeout(timer); done();
+  });
+  sock.on("error", () => { clearTimeout(timer); done(); });
+  function done() {
+    res.json({
+      status: "ok",
+      ueConnected: ueUp,
+      mcpConnected: ueUp,
+      pixelStreamingUrl: PIXEL_STREAMING_URL,
+      activeGenerations: activeSessions.size,
+      lastSessionAt: lastSessionResult?.timestamp || null
+    });
+  }
+});
+
+// ── Screenshot endpoints ──
+app.get("/api/screenshot/latest", (req, res) => {
+  let best = null;
+  for (const dir of SCREENSHOT_SEARCH_DIRS) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const entries = fs.readdirSync(dir)
+        .filter(f => f.endsWith(".png"))
+        .map(f => ({ filepath: path.join(dir, f), time: fs.statSync(path.join(dir, f)).mtimeMs }))
+        .filter(({ time }) => Date.now() - time < 1800000);
+      for (const e of entries) {
+        if (!best || e.time > best.time) best = e;
+      }
+    } catch {}
+  }
+  if (!best) return res.status(404).json({ error: "No screenshots found" });
+  res.setHeader("Cache-Control", "no-store");
+  res.sendFile(best.filepath);
+});
+
+app.get("/api/screenshot/file", (req, res) => {
+  const fp = req.query.path;
+  if (!fp || !fs.existsSync(fp)) return res.status(404).json({ error: "Not found" });
+  res.setHeader("Cache-Control", "no-store");
+  res.sendFile(path.resolve(fp));
+});
+
+// ── Camera ──
+app.post("/api/camera", (req, res) => {
+  const { cmd, args = [] } = req.body;
+  if (!["set_camera", "get_camera"].includes(cmd))
+    return res.status(400).json({ error: "Unknown camera command" });
+  const net = require("net");
+  const sock = new net.Socket();
+  const timer = setTimeout(() => { sock.destroy(); res.status(504).json({ error: "Timeout" }); }, 10000);
+  let params = {};
+  if (cmd === "set_camera" && args.length >= 6) {
+    params = { script: `
 import unreal
 subsys = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
-loc = unreal.Vector(${n[0]}, ${n[1]}, ${n[2]})
-rot = unreal.Rotator(${n[3]}, ${n[4]}, ${n[5]})
+loc = unreal.Vector(${args[0]}, ${args[1]}, ${args[2]})
+rot = unreal.Rotator(${args[3]}, ${args[4]}, ${args[5]})
 subsys.set_level_viewport_camera_info(loc, rot)
-`},a.connect(parseInt(UNREAL_PORT),UNREAL_HOST,()=>{a.write(JSON.stringify({type:"execute_python_script",params:m})+`
-`)});else return clearTimeout(c),e.json({ok:!0,result:"no-op"});let _="";a.on("data",h=>{_+=h.toString();try{const g=JSON.parse(_);clearTimeout(c),a.destroy(),e.json({ok:!0,result:g})}catch{}}),a.on("error",h=>{clearTimeout(c),e.status(500).json({error:h.message})})}),app.get("/api/skills",(s,e)=>{e.json(skillRegistry.list())}),app.get("/api/skills/:id",(s,e)=>{const t=skillRegistry.get(s.params.id);if(!t)return e.status(404).json({error:"Skill not found"});e.json(t)}),app.get("/api/skills/search/:query",(s,e)=>{e.json(skillRegistry.search(s.params.query))}),app.post("/api/skills/reload",(s,e)=>{skillRegistry.reload(),e.json({ok:!0,count:skillRegistry.list().length})}),app.post("/api/skills",(s,e)=>{const{id:t,name:n,description:o,tags:i,dependencies:a,content:c}=s.body;if(!t||!n||!c)return e.status(400).json({error:"id, name, and content are required"});const m=["---",`id: ${t}`,`name: ${n}`,"version: 1.0.0","author: custom",`tags: [${(i||[]).join(", ")}]`,`dependencies: [${(a||[]).join(", ")}]`,`description: ${o||n}`,"---","",c].join(`
-`),_=path.resolve(__dirname,"../../skills"),h=require("fs");h.mkdirSync(_,{recursive:!0});const g=path.join(_,`${t}.md`);h.writeFileSync(g,m,"utf-8"),skillRegistry.reload();const f=skillRegistry.get(t);e.json(f||{id:t,name:n,description:o,tags:i,source:"custom"})}),app.delete("/api/skills/:id",(s,e)=>{const t=skillRegistry.get(s.params.id);if(!t)return e.status(404).json({error:"Skill not found"});if(t.source!=="custom")return e.status(400).json({error:"Cannot delete builtin skills"});const n=require("fs");n.existsSync(t.filePath)&&n.unlinkSync(t.filePath),skillRegistry.reload(),e.json({ok:!0})}),app.get("/api/scenes",(s,e)=>{e.json(sceneManager.list())}),app.get("/api/scenes/:id",(s,e)=>{const t=sceneManager.load(s.params.id);if(!t)return e.status(404).json({error:"Scene not found"});e.json(t)}),app.post("/api/scenes",(s,e)=>{const t=sceneManager.save(s.body);e.json(t)}),app.delete("/api/scenes/:id",(s,e)=>{const t=sceneManager.delete(s.params.id);e.json({ok:t})}),app.get("/api/scenes/:id/thumbnail",(s,e)=>{const t=sceneManager.getThumbnailPath(s.params.id);if(!t)return e.status(404).json({error:"No thumbnail"});e.sendFile(t)}),app.post("/api/arena/battles",(s,e)=>{const{prompt:t,skills:n}=s.body,o=arenaManager.createBattle(t,n);e.json(o)}),app.get("/api/arena/battles",(s,e)=>{const{status:t,limit:n,offset:o}=s.query;e.json(arenaManager.listBattles({status:t,limit:Number(n)||50,offset:Number(o)||0}))}),app.get("/api/arena/battles/:id",(s,e)=>{const t=arenaManager.getBattle(s.params.id);if(!t)return e.status(404).json({error:"Battle not found"});e.json(t)}),app.post("/api/arena/battles/:id/submit",(s,e)=>{const{side:t,sceneData:n}=s.body,o=arenaManager.submitSceneForBattle(s.params.id,t,n);if(!o)return e.status(404).json({error:"Battle not found"});e.json(o)}),app.post("/api/arena/battles/:id/vote",(s,e)=>{const{winner:t}=s.body,n=arenaManager.vote(s.params.id,t);if(!n)return e.status(404).json({error:"Battle not found"});e.json(n)}),app.get("/api/arena/leaderboard",(s,e)=>{e.json(arenaManager.getLeaderboard())}),app.get("/api/arena/gallery",(s,e)=>{const{limit:t,offset:n,sort:o}=s.query;e.json(arenaManager.listGallery({limit:Number(t)||50,offset:Number(n)||0,sort:o}))}),app.post("/api/arena/gallery",(s,e)=>{const t=arenaManager.addToGallery(s.body);e.json(t)}),app.get("/api/arena/gallery/:id",(s,e)=>{const t=arenaManager.getGalleryScene(s.params.id);if(!t)return e.status(404).json({error:"Scene not found"});e.json(t)}),app.get("/api/agents",(s,e)=>{e.json(agentManager.list())}),app.post("/api/agents",(s,e)=>{const t=agentManager.register(s.body);e.json(t)}),app.patch("/api/agents/:id",(s,e)=>{const{enabled:t}=s.body;if(typeof t=="boolean"){const o=agentManager.toggleEnabled(s.params.id,t);return o?e.json(o):e.status(404).json({error:"Agent not found"})}const n=agentManager.register({id:s.params.id,...s.body});e.json(n)}),app.post("/api/arena/battles/:id/run",async(s,e)=>{const t=arenaManager.getBattle(s.params.id);if(!t)return e.status(404).json({error:"Battle not found"});if(t.status==="voted")return e.status(400).json({error:"Battle already completed"});e.setHeader("Content-Type","text/event-stream"),e.setHeader("Cache-Control","no-cache"),e.setHeader("Connection","keep-alive"),e.flushHeaders();function n(o,i){e.writableEnded||e.write(`event: ${o}
-data: ${JSON.stringify(i)}
+` };
+    sock.connect(parseInt(UNREAL_PORT), UNREAL_HOST, () => {
+      sock.write(JSON.stringify({ type: "execute_python_script", params }) + "\n");
+    });
+  } else {
+    clearTimeout(timer);
+    return res.json({ ok: true, result: "no-op" });
+  }
+  let buf = "";
+  sock.on("data", d => {
+    buf += d.toString();
+    try {
+      const parsed = JSON.parse(buf);
+      clearTimeout(timer); sock.destroy();
+      res.json({ ok: true, result: parsed });
+    } catch {}
+  });
+  sock.on("error", e => { clearTimeout(timer); res.status(500).json({ error: e.message }); });
+});
 
-`)}try{const o=await agentManager.runBattle(t.prompt,t.skills,ARENA_SYSTEM_PROMPT,(a,c)=>n("progress",{phase:a,...c}));arenaManager.submitSceneForBattle(t.id,"a",o.side_a),arenaManager.submitSceneForBattle(t.id,"b",o.side_b);const i=arenaManager.getBattle(t.id);n("complete",i)}catch(o){n("error",{message:o.message})}e.end()}),app.post("/api/arena/run",async(s,e)=>{const{prompt:t,skills:n}=s.body;if(!t)return e.status(400).json({error:"prompt required"});const o=arenaManager.createBattle(t,n||[]);e.setHeader("Content-Type","text/event-stream"),e.setHeader("Cache-Control","no-cache"),e.setHeader("Connection","keep-alive"),e.flushHeaders();function i(a,c){e.writableEnded||e.write(`event: ${a}
-data: ${JSON.stringify(c)}
+// ── Skills CRUD ──
+app.get("/api/skills", (req, res) => res.json(skillRegistry.list()));
 
-`)}i("battle_created",{battleId:o.id,prompt:t});try{const a=await agentManager.runBattle(t,n||[],ARENA_SYSTEM_PROMPT,(m,_)=>i("progress",{phase:m,..._}));arenaManager.submitSceneForBattle(o.id,"a",a.side_a),arenaManager.submitSceneForBattle(o.id,"b",a.side_b);const c=arenaManager.getBattle(o.id);i("complete",c)}catch(a){i("error",{message:a.message})}e.end()}),app.get("/api/assets",(s,e)=>{try{const t=JSON.parse(fs.readFileSync(path.join(__dirname,"assets.json"),"utf-8")),n={};for(const[o,i]of Object.entries(t)){const a={description:i.description||"",items:[]};o==="buildings"&&i.ids?(a.items=i.ids.map(c=>{const _=`BP_Building_${String(c).padStart(2,"0")}`;return{id:_,path:`/Game/CityDatabase/blueprints/${_}.${_}_C`}}),i.notes&&(a.description+=" "+i.notes)):i.items&&(a.items=i.items.map(c=>{if(typeof c=="string"){const m=c.split("/");return{id:m[m.length-1].split(".")[0],path:c}}return c})),n[o]=a}e.json(n)}catch(t){e.status(500).json({error:t.message})}}),app.post("/api/chat",(s,e)=>{const{message:t,sessionId:n,skills:o,feedback:i}=s.body;if(!t)return e.status(400).json({error:"message required"});e.setHeader("Content-Type","text/event-stream"),e.setHeader("Cache-Control","no-cache"),e.setHeader("Connection","keep-alive"),e.setHeader("X-Accel-Buffering","no"),e.flushHeaders();function a(d,r){e.writableEnded||e.write(`event: ${d}
-data: ${JSON.stringify(r)}
+app.get("/api/skills/:id", (req, res) => {
+  const s = skillRegistry.get(req.params.id);
+  if (!s) return res.status(404).json({ error: "Skill not found" });
+  res.json(s);
+});
 
-`)}const c=setInterval(()=>{e.writableEnded||e.write(`: ping
+app.get("/api/skills/search/:query", (req, res) => {
+  res.json(skillRegistry.search(req.params.query));
+});
 
-`)},15e3);let m=ARENA_SYSTEM_PROMPT;if(o&&o.length>0){const d=skillRegistry.compose(o);d&&(m+=`
+app.post("/api/skills/reload", (req, res) => {
+  skillRegistry.reload();
+  res.json({ ok: true, count: skillRegistry.list().length });
+});
 
-## ACTIVE SKILLS (reference documentation)
-`+d)}i&&(m+=`
+app.post("/api/skills", (req, res) => {
+  const { id, name, description, tags, dependencies, content } = req.body;
+  if (!id || !name || !content)
+    return res.status(400).json({ error: "id, name, and content are required" });
+  const frontmatter = [
+    "---", `id: ${id}`, `name: ${name}`, "version: 1.0.0", "author: custom",
+    `tags: [${(tags || []).join(", ")}]`,
+    `dependencies: [${(dependencies || []).join(", ")}]`,
+    `description: ${description || name}`, "---", "", content
+  ].join("\n");
+  const skillsDir = path.resolve(__dirname, "../../skills");
+  fs.mkdirSync(skillsDir, { recursive: true });
+  fs.writeFileSync(path.join(skillsDir, `${id}.md`), frontmatter, "utf-8");
+  skillRegistry.reload();
+  const result = skillRegistry.get(id);
+  res.json(result || { id, name, description, tags, source: "custom" });
+});
 
-## USER FEEDBACK ON CURRENT SCENE
-The user is providing feedback on the current scene. Modify the scene based on this feedback. Do NOT start from scratch \u2014 refine what exists.
-Feedback: ${i}`);const _=["-p",t,"--output-format","stream-json","--include-partial-messages","--verbose","--dangerously-skip-permissions","--mcp-config",MCP_CONFIG,"--append-system-prompt",m];n&&_.push("--resume",n);const h=Object.assign({},process.env);delete h.CLAUDECODE,delete h.CLAUDE_SESSION_ID,delete h.CLAUDE_CODE_ENTRYPOINT,logToFile("chat",`User: "${t.slice(0,200)}" sessionId=${n||"new"}`);try{fs.writeFileSync(path.join(LOG_DIR,"raw_latest.jsonl"),"")}catch{}const g=spawn(CLAUDE_BIN,_,{cwd:path.resolve(__dirname,".."),env:h,stdio:["ignore","pipe","pipe"]});let f="",w=new Set,S=n||null,b=null;function j(d){if(d=d.trim(),!d)return;try{fs.appendFileSync(path.join(LOG_DIR,"raw_latest.jsonl"),d+`
-`)}catch{}let r;try{r=JSON.parse(d)}catch{return}const u=r.type;if(u==="system"&&r.subtype==="init"){r.session_id&&(S=r.session_id);const p=(r.mcp_servers||[]).map(l=>`${l.name}:${l.status}`);a("system",{sessionId:r.session_id,mcpServers:r.mcp_servers||[]}),logToFile("claude",`Session ${r.session_id} | MCP: ${p.join(", ")}`)}else if(u==="stream_event"){const p=r.event||{};if(p.type==="content_block_delta"&&p.delta?.type==="text_delta"&&a("text",{delta:p.delta.text}),p.type==="content_block_start"&&p.content_block?.type==="tool_use"){const l=p.content_block;if(!w.has(l.id)){w.add(l.id);const y=l.name.replace(/^mcp__\w+__/,"");a("tool_start",{id:l.id,name:l.name,displayName:y}),logToFile("tool",`Starting: ${l.name}`)}}p.type==="content_block_delta"&&p.delta?.type==="input_json_delta"&&a("tool_input",{delta:p.delta.partial_json})}else if(u==="assistant"){const p=r.message?.content||[];for(const l of p)if(l.type==="tool_use"){const y=l.name.replace(/^mcp__\w+__/,"");a("tool_details",{id:l.id,name:l.name,displayName:y,input:l.input})}}else if(u==="user"){const p=r.message?.content||[];for(const l of p)if(l.type==="tool_result"){const y=Array.isArray(l.content)?l.content.map(P=>P.text||"").join(""):String(l.content||""),B=y.match(/([\/][\w\/\-._]+\.png)/);B&&fs.existsSync(B[1])&&(b=B[1],a("screenshot",{toolUseId:l.tool_use_id,filepath:`/api/screenshot/file?path=${encodeURIComponent(b)}`})),a("tool_result",{toolUseId:l.tool_use_id,result:y.slice(0,2e3),isError:l.is_error||!1}),logToFile("tool_result",`${l.tool_use_id?.slice(0,8)} \u2192 ${y.slice(0,300)}`)}}else if(u==="result"){S=r.session_id;const p=r.is_error||r.subtype==="error_during_turn";logToFile("claude",`Result: subtype=${r.subtype} session=${S} cost=$${r.total_cost_usd||"?"}`),logToFile("result",JSON.stringify({subtype:r.subtype,cost:r.total_cost_usd,duration:r.duration_ms}).slice(0,500)),T(),clearInterval(c),a("done",{sessionId:S,isError:p,costUsd:r.total_cost_usd,latestScreenshot:b?`/api/screenshot/file?path=${encodeURIComponent(b)}`:k()}),e.end()}}function T(){let d=null;if(fs.existsSync(SCREENSHOT_DIR))try{const r=fs.readdirSync(SCREENSHOT_DIR).filter(u=>u.endsWith(".png")).map(u=>({fp:path.join(SCREENSHOT_DIR,u),time:fs.statSync(path.join(SCREENSHOT_DIR,u)).mtimeMs})).filter(({time:u})=>Date.now()-u<18e5);for(const u of r)(!d||u.time>d.time)&&(d=u)}catch{}d&&(b=d.fp)}function k(){return T(),b?`/api/screenshot/file?path=${encodeURIComponent(b)}`:null}g.stdout.on("data",d=>{f+=d.toString();const r=f.split(`
-`);f=r.pop()??"";for(const u of r)j(u)}),g.stderr.on("data",d=>{const r=d.toString().trim();r&&logToFile("stderr",r.slice(0,300))}),g.on("close",d=>{clearInterval(c),f.trim()&&j(f),logToFile("claude",`Process exited with code ${d}`),e.writableEnded||(a("done",{sessionId:S,isError:d!==0,latestScreenshot:k()}),e.end())}),e.on("close",()=>{e.writableEnded||(clearInterval(c),g.killed||(g.kill("SIGTERM"),logToFile("claude","Browser closed connection, killed process")))})});const FRONTEND_DIR=path.resolve(__dirname,"../dist");fs.existsSync(FRONTEND_DIR)&&(app.use(express.static(FRONTEND_DIR)),app.get("*",(s,e)=>{!s.path.startsWith("/api/")&&!s.path.startsWith("/screenshots")&&!s.path.startsWith("/thumbnails")&&!s.path.startsWith("/ue")&&e.sendFile(path.join(FRONTEND_DIR,"index.html"))}),console.log("  Frontend served from:",FRONTEND_DIR)),app.listen(PORT,"0.0.0.0",()=>{console.log(`
-\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557`),console.log("\u2551       SimWorld Studio Backend                      \u2551"),console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563"),console.log(`\u2551  Listening : http://0.0.0.0:${PORT}                  \u2551`),console.log(`\u2551  Claude    : ${CLAUDE_BIN}                            \u2551`),console.log("\u2551  MCP config: mcp.json (local stdio)               \u2551"),console.log(`\u2551  UE TCP    : ${UNREAL_HOST}:${UNREAL_PORT}                 \u2551`),console.log(`\u2551  Logs      : ${LOG_DIR}          \u2551`),console.log(`\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
-`)});
+app.delete("/api/skills/:id", (req, res) => {
+  const s = skillRegistry.get(req.params.id);
+  if (!s) return res.status(404).json({ error: "Skill not found" });
+  if (s.source !== "custom") return res.status(400).json({ error: "Cannot delete builtin skills" });
+  if (fs.existsSync(s.filePath)) fs.unlinkSync(s.filePath);
+  skillRegistry.reload();
+  res.json({ ok: true });
+});
+
+// ── Scenes CRUD ──
+app.get("/api/scenes", (req, res) => res.json(sceneManager.list()));
+app.get("/api/scenes/:id", (req, res) => {
+  const s = sceneManager.load(req.params.id);
+  if (!s) return res.status(404).json({ error: "Scene not found" });
+  res.json(s);
+});
+app.post("/api/scenes", (req, res) => res.json(sceneManager.save(req.body)));
+app.delete("/api/scenes/:id", (req, res) => res.json({ ok: sceneManager.delete(req.params.id) }));
+app.get("/api/scenes/:id/thumbnail", (req, res) => {
+  const tp = sceneManager.getThumbnailPath(req.params.id);
+  if (!tp) return res.status(404).json({ error: "No thumbnail" });
+  res.sendFile(tp);
+});
+
+// ── Arena: battles, leaderboard, gallery ──
+app.post("/api/arena/battles", (req, res) => {
+  const { prompt, skills } = req.body;
+  res.json(arenaManager.createBattle(prompt, skills));
+});
+
+app.get("/api/arena/battles", (req, res) => {
+  const { status, limit, offset } = req.query;
+  res.json(arenaManager.listBattles({
+    status, limit: Number(limit) || 50, offset: Number(offset) || 0
+  }));
+});
+
+app.get("/api/arena/battles/:id", (req, res) => {
+  const b = arenaManager.getBattle(req.params.id);
+  if (!b) return res.status(404).json({ error: "Battle not found" });
+  res.json(b);
+});
+
+app.post("/api/arena/battles/:id/submit", (req, res) => {
+  const { side, sceneData } = req.body;
+  const result = arenaManager.submitSceneForBattle(req.params.id, side, sceneData);
+  if (!result) return res.status(404).json({ error: "Battle not found" });
+  res.json(result);
+});
+
+app.post("/api/arena/battles/:id/vote", (req, res) => {
+  const { winner } = req.body;
+  const result = arenaManager.vote(req.params.id, winner);
+  if (!result) return res.status(404).json({ error: "Battle not found" });
+  res.json(result);
+});
+
+app.get("/api/arena/leaderboard", (req, res) => res.json(arenaManager.getLeaderboard()));
+
+app.get("/api/arena/gallery", (req, res) => {
+  const { limit, offset, sort } = req.query;
+  res.json(arenaManager.listGallery({
+    limit: Number(limit) || 50, offset: Number(offset) || 0, sort
+  }));
+});
+
+app.post("/api/arena/gallery", (req, res) => res.json(arenaManager.addToGallery(req.body)));
+
+app.get("/api/arena/gallery/:id", (req, res) => {
+  const s = arenaManager.getGalleryScene(req.params.id);
+  if (!s) return res.status(404).json({ error: "Scene not found" });
+  res.json(s);
+});
+
+// ── Agents ──
+app.get("/api/agents", (req, res) => res.json(agentManager.list()));
+
+app.post("/api/agents", (req, res) => res.json(agentManager.register(req.body)));
+
+app.patch("/api/agents/:id", (req, res) => {
+  const { enabled } = req.body;
+  if (typeof enabled === "boolean") {
+    const a = agentManager.toggleEnabled(req.params.id, enabled);
+    return a ? res.json(a) : res.status(404).json({ error: "Agent not found" });
+  }
+  res.json(agentManager.register({ id: req.params.id, ...req.body }));
+});
+
+// ── Arena battle run (SSE) ──
+app.post("/api/arena/battles/:id/run", async (req, res) => {
+  const battle = arenaManager.getBattle(req.params.id);
+  if (!battle) return res.status(404).json({ error: "Battle not found" });
+  if (battle.status === "voted") return res.status(400).json({ error: "Battle already completed" });
+
+  // FIX: SSE headers for Cloudflare tunnel compatibility
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-store, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  function send(event, data) {
+    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  try {
+    const result = await agentManager.runBattle(
+      battle.prompt, battle.skills, ARENA_SYSTEM_PROMPT,
+      (phase, info) => send("progress", { phase, ...info })
+    );
+    arenaManager.submitSceneForBattle(battle.id, "a", result.side_a);
+    arenaManager.submitSceneForBattle(battle.id, "b", result.side_b);
+    send("complete", arenaManager.getBattle(battle.id));
+  } catch (e) {
+    send("error", { message: e.message });
+  }
+  res.end();
+});
+
+// ── Arena combined run (SSE) ──
+app.post("/api/arena/run", async (req, res) => {
+  const { prompt, skills } = req.body;
+  if (!prompt) return res.status(400).json({ error: "prompt required" });
+  const battle = arenaManager.createBattle(prompt, skills || []);
+
+  // FIX: SSE headers for Cloudflare tunnel compatibility
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-store, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  function send(event, data) {
+    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  send("battle_created", { battleId: battle.id, prompt });
+
+  try {
+    const result = await agentManager.runBattle(
+      prompt, skills || [], ARENA_SYSTEM_PROMPT,
+      (phase, info) => send("progress", { phase, ...info })
+    );
+    arenaManager.submitSceneForBattle(battle.id, "a", result.side_a);
+    arenaManager.submitSceneForBattle(battle.id, "b", result.side_b);
+    send("complete", arenaManager.getBattle(battle.id));
+  } catch (e) {
+    send("error", { message: e.message });
+  }
+  res.end();
+});
+
+// ── Assets ──
+app.get("/api/assets", (req, res) => {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "assets.json"), "utf-8"));
+    const result = {};
+    for (const [cat, info] of Object.entries(raw)) {
+      const entry = { description: info.description || "", items: [] };
+      if (cat === "buildings" && info.ids) {
+        entry.items = info.ids.map(id => {
+          const name = `BP_Building_${String(id).padStart(2, "0")}`;
+          return { id: name, path: `/Game/CityDatabase/blueprints/${name}.${name}_C` };
+        });
+        if (info.notes) entry.description += " " + info.notes;
+      } else if (info.items) {
+        entry.items = info.items.map(item => {
+          if (typeof item === "string") {
+            const parts = item.split("/");
+            return { id: parts[parts.length - 1].split(".")[0], path: item };
+          }
+          return item;
+        });
+      }
+      result[cat] = entry;
+    }
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// /api/chat — Main chat endpoint with ALL tunnel-resilience fixes
+// ═══════════════════════════════════════════════════════════════════════
+app.post("/api/chat", (req, res) => {
+  const { message, sessionId, skills, feedback } = req.body;
+  if (!message) return res.status(400).json({ error: "message required" });
+
+  // FIX 3: SSE headers — add no-transform to prevent Cloudflare buffering
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-store, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  function send(event, data) {
+    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  // FIX 4: Aggressive keepalive — 8s with data payload to defeat proxy timeouts
+  const keepalive = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(`event: ping\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`);
+    }
+  }, 8000);
+
+  // Build system prompt with skills
+  let systemPrompt = ARENA_SYSTEM_PROMPT;
+  if (skills && skills.length > 0) {
+    const composed = skillRegistry.compose(skills);
+    if (composed) systemPrompt += "\n\n## ACTIVE SKILLS (reference documentation)\n" + composed;
+  }
+  if (feedback) {
+    systemPrompt += `\n\n## USER FEEDBACK ON CURRENT SCENE
+The user is providing feedback on the current scene. Modify the scene based on this feedback. Do NOT start from scratch — refine what exists.
+Feedback: ${feedback}`;
+  }
+
+  // Build Claude CLI args
+  const args = [
+    "-p", message,
+    "--output-format", "stream-json",
+    "--include-partial-messages",
+    "--verbose",
+    "--dangerously-skip-permissions",
+    "--mcp-config", MCP_CONFIG,
+    "--append-system-prompt", systemPrompt
+  ];
+  if (sessionId) args.push("--resume", sessionId);
+
+  // Clean env for Claude subprocess
+  const env = Object.assign({}, process.env);
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_SESSION_ID;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+
+  logToFile("chat", `User: "${message.slice(0, 200)}" sessionId=${sessionId || "new"}`);
+  try { fs.writeFileSync(path.join(LOG_DIR, "raw_latest.jsonl"), ""); } catch {}
+
+  const proc = spawn(CLAUDE_BIN, args, {
+    cwd: path.resolve(__dirname, ".."),
+    env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  let buffer = "";
+  let seenToolIds = new Set();
+  let currentSessionId = sessionId || null;
+  let latestScreenshotPath = null;
+  let browserDisconnected = false;
+
+  // Track this as an active session
+  const trackingId = sessionId || `pending_${Date.now()}`;
+  activeSessions.set(trackingId, { status: "running", startedAt: Date.now() });
+
+  function processLine(line) {
+    line = line.trim();
+    if (!line) return;
+    try { fs.appendFileSync(path.join(LOG_DIR, "raw_latest.jsonl"), line + "\n"); } catch {}
+
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+
+    const type = msg.type;
+
+    if (type === "system" && msg.subtype === "init") {
+      if (msg.session_id) {
+        currentSessionId = msg.session_id;
+        // Update tracking key
+        activeSessions.delete(trackingId);
+        activeSessions.set(currentSessionId, { status: "running", startedAt: Date.now() });
+      }
+      const servers = (msg.mcp_servers || []).map(s => `${s.name}:${s.status}`);
+      send("system", { sessionId: msg.session_id, mcpServers: msg.mcp_servers || [] });
+      logToFile("claude", `Session ${msg.session_id} | MCP: ${servers.join(", ")}`);
+    }
+    else if (type === "stream_event") {
+      const ev = msg.event || {};
+      if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+        send("text", { delta: ev.delta.text });
+      }
+      if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
+        const block = ev.content_block;
+        if (!seenToolIds.has(block.id)) {
+          seenToolIds.add(block.id);
+          const displayName = block.name.replace(/^mcp__\w+__/, "");
+          send("tool_start", { id: block.id, name: block.name, displayName });
+          logToFile("tool", `Starting: ${block.name}`);
+        }
+      }
+      if (ev.type === "content_block_delta" && ev.delta?.type === "input_json_delta") {
+        send("tool_input", { delta: ev.delta.partial_json });
+      }
+    }
+    else if (type === "assistant") {
+      const content = msg.message?.content || [];
+      for (const block of content) {
+        if (block.type === "tool_use") {
+          const displayName = block.name.replace(/^mcp__\w+__/, "");
+          send("tool_details", { id: block.id, name: block.name, displayName, input: block.input });
+        }
+      }
+    }
+    else if (type === "user") {
+      const content = msg.message?.content || [];
+      for (const block of content) {
+        if (block.type === "tool_result") {
+          const text = Array.isArray(block.content)
+            ? block.content.map(c => c.text || "").join("")
+            : String(block.content || "");
+          const pngMatch = text.match(/([\/][\w\/\-._]+\.png)/);
+          if (pngMatch && fs.existsSync(pngMatch[1])) {
+            latestScreenshotPath = pngMatch[1];
+            send("screenshot", {
+              toolUseId: block.tool_use_id,
+              filepath: `/api/screenshot/file?path=${encodeURIComponent(latestScreenshotPath)}`
+            });
+          }
+          send("tool_result", {
+            toolUseId: block.tool_use_id,
+            result: text.slice(0, 2000),
+            isError: block.is_error || false
+          });
+          logToFile("tool_result", `${block.tool_use_id?.slice(0, 8)} → ${text.slice(0, 300)}`);
+        }
+      }
+    }
+    else if (type === "result") {
+      currentSessionId = msg.session_id;
+      const isError = msg.is_error || msg.subtype === "error_during_turn";
+      logToFile("claude", `Result: subtype=${msg.subtype} session=${currentSessionId} cost=$${msg.total_cost_usd || "?"}`);
+      logToFile("result", JSON.stringify({
+        subtype: msg.subtype, cost: msg.total_cost_usd, duration: msg.duration_ms
+      }).slice(0, 500));
+
+      findLatestScreenshot();
+      clearInterval(keepalive);
+
+      const screenshotUrl = latestScreenshotPath
+        ? `/api/screenshot/file?path=${encodeURIComponent(latestScreenshotPath)}`
+        : findLatestScreenshotUrl();
+
+      const donePayload = {
+        sessionId: currentSessionId,
+        isError,
+        costUsd: msg.total_cost_usd,
+        latestScreenshot: screenshotUrl
+      };
+
+      // FIX 5: Always cache result — browser may have disconnected
+      lastSessionResult = {
+        ...donePayload,
+        timestamp: Date.now(),
+        prompt: message.slice(0, 200)
+      };
+      activeSessions.delete(currentSessionId || trackingId);
+      logToFile("cache", `Session result cached: ${currentSessionId}`);
+
+      // Send to browser if still connected
+      send("done", donePayload);
+      res.end();
+    }
+  }
+
+  function findLatestScreenshot() {
+    let best = null;
+    if (fs.existsSync(SCREENSHOT_DIR)) {
+      try {
+        const entries = fs.readdirSync(SCREENSHOT_DIR)
+          .filter(f => f.endsWith(".png"))
+          .map(f => ({ fp: path.join(SCREENSHOT_DIR, f), time: fs.statSync(path.join(SCREENSHOT_DIR, f)).mtimeMs }))
+          .filter(({ time }) => Date.now() - time < 1800000);
+        for (const e of entries) {
+          if (!best || e.time > best.time) best = e;
+        }
+      } catch {}
+    }
+    if (best) latestScreenshotPath = best.fp;
+  }
+
+  function findLatestScreenshotUrl() {
+    findLatestScreenshot();
+    return latestScreenshotPath
+      ? `/api/screenshot/file?path=${encodeURIComponent(latestScreenshotPath)}`
+      : null;
+  }
+
+  // stdout → parse JSON lines
+  proc.stdout.on("data", chunk => {
+    buffer += chunk.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) processLine(line);
+  });
+
+  proc.stderr.on("data", chunk => {
+    const text = chunk.toString().trim();
+    if (text) logToFile("stderr", text.slice(0, 300));
+  });
+
+  proc.on("close", exitCode => {
+    clearInterval(keepalive);
+    if (buffer.trim()) processLine(buffer);
+    logToFile("claude", `Process exited with code ${exitCode}`);
+
+    // FIX 6: Cache result even if browser already disconnected
+    if (!lastSessionResult || lastSessionResult.sessionId !== currentSessionId) {
+      findLatestScreenshot();
+      lastSessionResult = {
+        sessionId: currentSessionId,
+        isError: exitCode !== 0,
+        latestScreenshot: findLatestScreenshotUrl(),
+        timestamp: Date.now(),
+        prompt: message.slice(0, 200)
+      };
+      activeSessions.delete(currentSessionId || trackingId);
+    }
+
+    if (!res.writableEnded) {
+      send("done", {
+        sessionId: currentSessionId,
+        isError: exitCode !== 0,
+        latestScreenshot: findLatestScreenshotUrl()
+      });
+      res.end();
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // FIX 7: Browser disconnect handler — DO NOT kill Claude
+  // The Cloudflare tunnel drops connections frequently. If we kill
+  // Claude here, all generation work is lost. Instead, let Claude
+  // finish and cache the result for /api/session/latest recovery.
+  // ═══════════════════════════════════════════════════════════════════
+  res.on("close", () => {
+    browserDisconnected = true;
+    clearInterval(keepalive);
+
+    if (!proc.killed) {
+      // OLD (broken): proc.kill("SIGTERM")
+      // NEW: Let Claude finish — result will be cached
+      logToFile("claude",
+        "Browser/tunnel disconnected — Claude continues running. " +
+        "Result will be cached in /api/session/latest for recovery."
+      );
+    }
+  });
+});
+
+// ── Serve frontend ──
+const FRONTEND_DIR = path.resolve(__dirname, "../dist");
+if (fs.existsSync(FRONTEND_DIR)) {
+  app.use(express.static(FRONTEND_DIR));
+  app.get("*", (req, res) => {
+    if (!req.path.startsWith("/api/") &&
+        !req.path.startsWith("/screenshots") &&
+        !req.path.startsWith("/thumbnails") &&
+        !req.path.startsWith("/ue")) {
+      res.sendFile(path.join(FRONTEND_DIR, "index.html"));
+    }
+  });
+  console.log("  Frontend served from:", FRONTEND_DIR);
+}
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`
+╔══════════════════════════════════════════════════════╗
+║       SimWorld Studio Backend                        ║
+╠══════════════════════════════════════════════════════╣
+║  Listening : http://0.0.0.0:${PORT}                    ║
+║  Claude    : ${CLAUDE_BIN}                              ║
+║  MCP config: mcp.json (local stdio)                  ║
+║  UE TCP    : ${UNREAL_HOST}:${UNREAL_PORT}                   ║
+║  Logs      : ${LOG_DIR}            ║
+║                                                      ║
+║  Tunnel-resilience fixes:                            ║
+║    ✓ 8s keepalive pings (defeats proxy timeouts)     ║
+║    ✓ no-transform header (defeats proxy buffering)   ║
+║    ✓ Claude survives browser disconnects             ║
+║    ✓ Session results cached for recovery             ║
+║    ✓ GET /api/session/latest for reconnection        ║
+╚══════════════════════════════════════════════════════╝
+`);
+});

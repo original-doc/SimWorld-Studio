@@ -5,6 +5,195 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="icon" type="image/png" href="/logo.png" />
   <title>SimWorld Studio</title>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       FIX: Reconnection layer for Cloudflare tunnel resilience
+       Intercepts fetch to /api/chat, adds retry + session recovery.
+       This runs BEFORE the React app loads.
+       ═══════════════════════════════════════════════════════════════ -->
+  <script>
+  (function() {
+    'use strict';
+
+    // ── State ──
+    let lastKnownSessionId = null;
+    let reconnectBanner = null;
+
+    // ── Banner UI (shows when SSE stream breaks) ──
+    function showReconnectBanner(msg) {
+      if (!reconnectBanner) {
+        reconnectBanner = document.createElement('div');
+        reconnectBanner.id = 'reconnect-banner';
+        reconnectBanner.style.cssText =
+          'position:fixed;top:0;left:0;right:0;z-index:99999;' +
+          'background:#1f3a5f;border-bottom:2px solid #1f6feb;' +
+          'color:#58a6ff;text-align:center;padding:8px 16px;' +
+          'font-family:-apple-system,sans-serif;font-size:13px;' +
+          'display:flex;align-items:center;justify-content:center;gap:10px;' +
+          'transition:transform 0.3s;transform:translateY(0);';
+        document.body.appendChild(reconnectBanner);
+      }
+      reconnectBanner.innerHTML = msg;
+      reconnectBanner.style.transform = 'translateY(0)';
+    }
+
+    function hideReconnectBanner() {
+      if (reconnectBanner) {
+        reconnectBanner.style.transform = 'translateY(-100%)';
+        setTimeout(() => { if (reconnectBanner) reconnectBanner.remove(); reconnectBanner = null; }, 400);
+      }
+    }
+
+    // ── Poll /api/session/latest to recover after disconnect ──
+    async function pollForSessionResult(maxAttempts) {
+      maxAttempts = maxAttempts || 60; // 5 min at 5s intervals
+      for (let i = 0; i < maxAttempts; i++) {
+        showReconnectBanner(
+          '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;' +
+          'background:#d29922;animation:pulse 1s infinite"></span> ' +
+          'Connection lost — Claude is still working. Checking for results... (' + (i+1) + '/' + maxAttempts + ')' +
+          '<style>@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}</style>'
+        );
+
+        try {
+          const res = await fetch('/api/session/latest?t=' + Date.now());
+          if (res.ok) {
+            const data = await res.json();
+            // Check if this is a NEW result (after our request)
+            if (data.timestamp && data.timestamp > (window.__chatStartTime || 0)) {
+              showReconnectBanner(
+                '<span style="color:#3fb950">✓</span> Session recovered! ' +
+                (data.latestScreenshot ? 'Screenshot available.' : '') +
+                ' <button onclick="location.reload()" style="margin-left:8px;padding:4px 12px;' +
+                'border-radius:4px;border:1px solid #3fb950;background:transparent;' +
+                'color:#3fb950;cursor:pointer;font-size:12px">Reload to see results</button>'
+              );
+              // Also try to update the viewport screenshot
+              if (data.latestScreenshot) {
+                const img = document.querySelector('img[alt="UE viewport"]');
+                if (img) img.src = data.latestScreenshot + '?t=' + Date.now();
+              }
+              return data;
+            }
+          }
+        } catch (e) { /* server might be temporarily unreachable too */ }
+
+        // Also check if generation is still active
+        try {
+          const activeRes = await fetch('/api/session/active');
+          if (activeRes.ok) {
+            const activeData = await activeRes.json();
+            if (activeData.active && activeData.active.length === 0 && activeData.lastResult) {
+              // No active sessions + we have a result
+              if (activeData.lastResult.timestamp > (window.__chatStartTime || 0)) {
+                showReconnectBanner(
+                  '<span style="color:#3fb950">✓</span> Generation complete! ' +
+                  '<button onclick="location.reload()" style="margin-left:8px;padding:4px 12px;' +
+                  'border-radius:4px;border:1px solid #3fb950;background:transparent;' +
+                  'color:#3fb950;cursor:pointer;font-size:12px">Reload to see results</button>'
+                );
+                return activeData.lastResult;
+              }
+            }
+          }
+        } catch (e) {}
+
+        await new Promise(r => setTimeout(r, 5000));
+      }
+
+      showReconnectBanner(
+        '<span style="color:#f85149">✗</span> Could not recover session. ' +
+        '<button onclick="location.reload()" style="margin-left:8px;padding:4px 12px;' +
+        'border-radius:4px;border:1px solid #f85149;background:transparent;' +
+        'color:#f85149;cursor:pointer;font-size:12px">Reload page</button>'
+      );
+      return null;
+    }
+
+    // ── Intercept fetch to add resilience to /api/chat ──
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options) {
+      // Only intercept /api/chat POST requests
+      if (typeof url === 'string' && url.includes('/api/chat') && options && options.method === 'POST') {
+        window.__chatStartTime = Date.now();
+
+        return originalFetch.apply(this, arguments).then(function(response) {
+          if (!response.ok || !response.body) return response;
+
+          // Wrap the ReadableStream to detect premature close
+          const originalBody = response.body;
+          const reader = originalBody.getReader();
+          let streamDone = false;
+          let gotDoneEvent = false;
+
+          const wrappedStream = new ReadableStream({
+            start(controller) {
+              function pump() {
+                reader.read().then(function({ done, value }) {
+                  if (done) {
+                    streamDone = true;
+                    controller.close();
+
+                    // Check if we got a proper "done" event
+                    if (!gotDoneEvent) {
+                      console.warn('[SimWorld] SSE stream ended without done event — attempting recovery');
+                      pollForSessionResult(60);
+                    } else {
+                      hideReconnectBanner();
+                    }
+                    return;
+                  }
+
+                  // Scan for "done" event in the chunk
+                  const text = new TextDecoder().decode(value);
+                  if (text.includes('event: done')) {
+                    gotDoneEvent = true;
+                    hideReconnectBanner();
+                  }
+
+                  controller.enqueue(value);
+                  pump();
+                }).catch(function(err) {
+                  // Stream broke (network error, tunnel drop, etc.)
+                  if (!streamDone && err.name !== 'AbortError') {
+                    console.warn('[SimWorld] SSE stream error — starting recovery poll', err.message);
+                    pollForSessionResult(60);
+                  }
+                  controller.error(err);
+                });
+              }
+              pump();
+            },
+            cancel(reason) {
+              reader.cancel(reason);
+            }
+          });
+
+          // Return a new Response with the wrapped stream
+          return new Response(wrappedStream, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers
+          });
+
+        }).catch(function(err) {
+          // fetch itself failed (no network at all)
+          if (err.name !== 'AbortError') {
+            console.warn('[SimWorld] Chat fetch failed — starting recovery poll', err.message);
+            pollForSessionResult(60);
+          }
+          throw err;
+        });
+      }
+
+      // All other requests pass through unchanged
+      return originalFetch.apply(this, arguments);
+    };
+
+    console.log('[SimWorld] Tunnel reconnection layer loaded');
+  })();
+  </script>
+
   <script type="module" crossorigin src="/assets/index-CH7wPcSb.js"></script>
   <link rel="stylesheet" crossorigin href="/assets/index-CP3JY2OL.css">
 </head>
